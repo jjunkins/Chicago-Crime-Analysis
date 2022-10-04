@@ -1,0 +1,912 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+```{r}
+#install.packages("odbc")
+library(tidyverse)
+library(lubridate)
+library(odbc)
+library(randomForest)
+library(caret)
+library(xgboost)
+library(caret) # Load Caret
+library(OptimalCutpoints) # Load optimal cutpoints
+library(ggplot2) # Load ggplot2
+library(xgboostExplainer) # Load XGboost Explainer
+library(pROC) # Load proc
+library(SHAPforxgboost) # Load shap for XGBoost
+library(devtools)
+library(ggmap) #may need to install this one using devtools::install_github("dkahle/ggmap", ref = "tidyup")
+library(RColorBrewer)
+library(osmdata)
+library(pacman)
+#install.packages("Metrics")
+library(Metrics)
+#install.packages("fastDummies")
+library(fastDummies)
+```
+
+
+```{r}
+setwd("/Users/jerodjunkins/Desktop/Fall 2022/Machine Learning/Data")
+chicago_2022 <- read.csv(file = 'Crimes.csv')
+chicago_2022 <- na.omit(chicago_2022)
+chicago_2021 <- read.csv(file = 'Crimes2021.csv')
+chicago_2021 <- na.omit(chicago_2021)
+chicago <- rbind(chicago_2021, chicago_2022)
+```
+
+```{r}
+length(unique(chicago$District))
+unique(chicago$District)
+length(unique(chicago$Ward))
+unique(chicago$Ward)
+length(unique(chicago$Beat))
+unique(chicago$Beat)
+```
+
+```{r}
+chicago$NewDate <- substr(chicago$Date, 1, 10)
+chicago$DateOnly <- as.Date(chicago$NewDate, '%m/%d/%Y')
+chicago$weekday <- wday(chicago$DateOnly)
+head(chicago)
+```
+```{r}
+chicago$Hour <- substr(chicago$Date, 11, 13)
+chicago$Hour <- as.integer(chicago$Hour)
+chicago$Meridiem <- substr(chicago$Date, 21, 22)
+chicago$TimeOfDay[chicago$Hour == 12 & chicago$Meridiem == "AM"] <- "Night"
+chicago$TimeOfDay[chicago$Hour > 0 & chicago$Hour <= 4 & chicago$Meridiem == "AM"] <- "Night"
+chicago$TimeOfDay[chicago$Hour > 4 & chicago$Hour <= 11 & chicago$Meridiem == "AM"] <- "Morning"
+chicago$TimeOfDay[(chicago$Hour > 11 | chicago$Hour <= 4) & chicago$Meridiem == "PM"] <- "Afternoon"
+chicago$TimeOfDay[chicago$Hour > 4 & chicago$Hour <= 7 & chicago$Meridiem == "PM"] <- "Evening"
+chicago$TimeOfDay[chicago$Hour > 7 & chicago$Meridiem == "PM"] <- "Night"
+```
+
+```{r}
+# get month
+chicago$month <- format(chicago$DateOnly, '%m')
+
+chicago$month <- as.integer(chicago$month)
+# get last month
+chicago$last_month <- as.numeric(format(chicago$DateOnly, '%m')) - 1
+
+# get season
+chicago$season <- case_when(
+  chicago$month %in%  3:5  ~ "Spring",
+  chicago$month %in%  9:11 ~ "Fall",
+  chicago$month %in%  6:8  ~ "Summer",
+  TRUE ~ "Winter")
+
+# for prediction purposes→ converting seasons to numeric
+chicago$season_numeric <- case_when(
+  chicago$season %in%  "Spring" ~ 1,
+  chicago$season %in%  "Summer" ~ 2,
+  chicago$season %in%  "Fall"~ 3,
+  TRUE ~ 4)
+
+# Get week of the year 1-52.
+chicago$week <- as.numeric(format(chicago$DateOnly, "%V"))
+
+```
+
+
+
+ARSON, CRIMINAL SEXUAL ASSAULT, INTERFERENCE WITH PUBLIC OFFICER, SEX OFFENSE, WEAPONS VIOILATION, ASSAULT, HOMICIDE, PUBLIC PEACE VIOLATION, BATTERY, HUMAN TRAFFICKING, ROBBERY, KIDNAPPING, OFFENSE INVOLVING CHILDREN
+```{r}
+table(chicago$Primary.Type)
+```
+
+```{r}
+chicago$violent_crime <- case_when(chicago$Primary.Type %in% c('ARSON', 'CRIMINAL SEXUAL ASSAULT', 'INTERFERENCE WITH PUBLIC OFFICER', 'SEX OFFENSE', 'WEAPONS VIOILATION', 'ASSAULT', 'HOMICIDE', 'PUBLIC PEACE VIOLATION', 'BATTERY', 'HUMAN TRAFFICKING', 'ROBBERY', 'KIDNAPPING', 'OFFENSE INVOLVING CHILDREN')~ 1, chicago$Primary.Type != c('ARSON', 'CRIMINAL SEXUAL ASSAULT', 'INTERFERENCE WITH PUBLIC OFFICER', 'SEX OFFENSE', 'WEAPONS VIOILATION', 'ASSAULT', 'HOMICIDE', 'PUBLIC PEACE VIOLATION', 'BATTERY', 'HUMAN TRAFFICKING', 'ROBBERY', 'KIDNAPPING', 'OFFENSE INVOLVING CHILDREN') ~ 0)
+```
+
+```{r}
+# Get ward/beat violent crimes by month and season
+beat_by_month <- chicago %>% group_by(Beat, month)
+ward_by_month<- chicago %>% group_by(Ward, month)
+beat_by_season_numeric <- chicago %>% group_by(Beat, season_numeric)
+ward_by_season_numeric<- chicago %>% group_by(Ward, season_numeric)
+
+beat_by_month_df <-beat_by_month %>% summarize(total_violent_crimes = sum(violent_crime), non_violent_crimes = sum(violent_crime == 0))
+beat_by_season_numeric_df <- beat_by_season_numeric %>% summarize(total_violent_crimes = sum(violent_crime), non_violent_crimes = sum(violent_crime == 0))
+ward_by_month_df <- ward_by_month %>% summarize(total_violent_crimes = sum(violent_crime), non_violent_crimes = sum(violent_crime == 0))
+ward_by_season_numeric_df <- ward_by_season_numeric %>% summarize(total_violent_crimes = sum(violent_crime), non_violent_crimes = sum(violent_crime == 0))
+
+```
+
+```{r}
+# add column for last month's violent crime by beat 
+beat_by_month_df <- beat_by_month_df %>%
+   group_by(Beat) %>%
+   mutate("last_month_vc" = lag(total_violent_crimes))
+
+
+# add column for last month's nonviolent crime by beat
+beat_by_month_df <- beat_by_month_df %>%
+   group_by(Beat) %>%
+   mutate("last_month_non_vc" = lag(non_violent_crimes))
+
+# add column for last month's violent crime by ward
+ward_by_month_df <- ward_by_month_df %>%
+   group_by(Ward) %>%
+   mutate("last_month_vc" = lag(total_violent_crimes))
+
+# add column for last month's nonviolent crime by ward
+ward_by_month_df <- ward_by_month_df %>%
+   group_by(Ward) %>%
+   mutate("last_month_non_vc" = lag(non_violent_crimes))
+
+```
+
+
+```{r}
+districts_by_week <- chicago %>% group_by(District, weekday)
+wards_by_week <- chicago %>% group_by(Ward, weekday)
+beats_by_week <- chicago %>% group_by(Beat, weekday)
+```
+
+```{r}
+districts_by_week %>% summarize(total_violent_crimes = sum(violent_crime))
+wards_by_week %>% summarize(total_violent_crimes = sum(violent_crime))
+beats_by_week %>% summarize(total_violent_crimes = sum(violent_crime))
+```
+
+```{r}
+beats_by_week$weekday <- as.numeric(beats_by_week$weekday)
+beats_by_week$Beat <- as.numeric(beats_by_week$Beat)
+```
+
+```{r}
+# Group by beat/ward and week of the year
+beat_by_week <- chicago %>% group_by(Beat, week)
+ward_by_week <- chicago %>% group_by(Ward, week)
+
+ward_by_week_df <- ward_by_week %>% summarize(total_violent_crimes = sum(violent_crime), non_violent_crimes = sum(violent_crime == 0))
+beat_by_week_df <- beat_by_week %>% summarize(total_violent_crimes = sum(violent_crime), non_violent_crimes = sum(violent_crime == 0))
+
+```
+
+```{r}
+# Add new columns for total violent crimes and non-violent crimes from the previous week for each beat and ward
+beat_by_week_df <- beat_by_week_df %>% group_by(Beat) %>% mutate("last_vc" = lag(total_violent_crimes))
+beat_by_week_df <- beat_by_week_df %>% group_by(Beat) %>% mutate("last_non_vc" = lag(non_violent_crimes))
+
+ward_by_week_df <- ward_by_week_df %>% group_by(Ward) %>% mutate("last_vc" = lag(total_violent_crimes))
+ward_by_week_df <- ward_by_week_df %>% group_by(Ward) %>% mutate("last_non_vc" = lag(non_violent_crimes))
+
+```
+
+
+```{r}
+head(chicago,20)
+head(ward_by_month_df)
+head(beat_by_month_df)
+head(beat_by_week_df)
+head(ward_by_week_df)
+```
+
+Clustering
+```{r}
+# K Means clustering data preparation
+wards <- chicago %>% group_by(Ward)
+wards <- wards %>% summarize(total_violent_crimes = sum(violent_crime), non_violent_crimes = sum(violent_crime == 0))
+wards
+```
+
+```{r}
+# Create function to try different cluster numbers
+kmean_withinss <- function(k) {
+  cluster <- kmeans( x = wards[,2:3],  # Set data to use
+                    centers = k,  # Set number of clusters as k, changes with input into function
+                    nstart = 25, # Set number of starts
+                    iter.max = 100) # Set max number of iterations
+  return (cluster$tot.withinss) # Return cluster error/within cluster sum of squares
+}
+
+
+# Set maximum cluster number
+max_k <-20
+# Run algorithm over a range of cluster numbers 
+wss <- sapply(2:max_k, kmean_withinss)
+
+
+# Create a data frame to plot the graph
+elbow <-data.frame(2:max_k, wss)
+
+# Plot the graph with ggplot
+g_e1 <- ggplot(elbow, # Set dataset
+              aes(x = X2.max_k, y = wss)) + # Set aesthetics
+  theme_set(theme_bw(base_size = 22) ) + # Set theme
+  geom_point(color = "blue") + # Set geom point for scatter
+  geom_line() + # Geom line for a line between points
+  scale_x_continuous(breaks = seq(1, 20, by = 1)) + # Set breaks for x-axis
+  labs(x = "Number of Clusters", y="Within Cluster \nSum of Squares") + # Set labels
+  theme(panel.grid.major = element_blank(), # Turn of the background grid
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+# Generate plot
+g_e1
+```
+
+```{r}
+set.seed(12345) # Set seed for reproducibility
+fit_2 <- kmeans(x = wards[2:3], # Set data as explanatory variables 
+                centers = 6,  # Set number of clusters
+                nstart = 25, # Set number of starts
+                iter.max = 100 ) # Set maximum number of iterations to use
+
+# Extract clusters
+clusters_2 <- fit_2$cluster
+# Extract centers
+centers_2 <- fit_2$centers
+
+summary(as.factor(clusters_2))
+
+cat("Cluster 1 Wards:\n")
+wards$Ward[clusters_2 == 1]
+
+cat("Cluster 2 Wards:\n")
+wards$Ward[clusters_2 == 2]
+
+cat("Cluster 3 Wards:\n")
+wards$Ward[clusters_2 == 3]
+
+cat("Cluster 4 Wards:\n")
+wards$Ward[clusters_2 == 4]
+
+cat("Cluster 5 Wards:\n")
+wards$Ward[clusters_2 == 5]
+
+cat("Cluster 6 Wards:\n")
+wards$Ward[clusters_2 == 6]
+```
+
+```{r}
+# Create vector of clusters
+cluster <- c(1: 6)
+# Extract centers
+center_df <- data.frame(cluster, centers_2)
+
+# Reshape the data
+center_reshape <- gather(center_df, features, values, total_violent_crimes, non_violent_crimes)
+# View first few rows
+center_reshape
+```
+
+```{r}
+g_heat_2 <- ggplot(data = center_reshape, # Set dataset
+                   aes(x = features, y = cluster, fill = values)) + # Set aesthetics
+  scale_y_continuous(breaks = seq(1, 6, by = 1)) + # Set y axis breaks
+  geom_tile() + # Geom tile for heatmap
+  coord_equal() +  # Make scale the same for both axis
+  theme_set(theme_bw(base_size = 22) ) + # Set theme
+  scale_fill_gradient2(low = "blue", # Choose low color
+                       mid = "white", # Choose mid color
+                       high = "red", # Choose high color
+                       midpoint =0, # Choose mid point
+                       space = "Lab", 
+                       na.value ="grey", # Choose NA value
+                       guide = "colourbar", # Set color bar
+                       aesthetics = "fill") + # Select aesthetics to apply
+  coord_flip() # Rotate plot to view names clearly
+
+g_heat_2
+```
+
+
+
+Crime count by TimeOfDay
+```{r}
+ggplot(chicago, aes(TimeOfDay)) + geom_bar(fill = "red") + # Set theme and text size
+  theme(panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) +
+  labs(x = "Time Of Day", y = "Number Of Crimes")
+```
+Plot crimes by season
+```{r}
+ggplot(chicago, aes(season)) + geom_bar(fill = "blue") + geom_bar( aes(y = violent_crime), stat = "identity",fill = "red") + # Set theme and text size
+  theme(panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) +
+  labs(x = "Season", y = "Number Of Crimes", title = "Crime Count By Season - Chicago 2021-22")
+```
+
+
+Plot crime count by ward
+```{r}
+ggplot(chicago, aes(Ward)) + geom_bar(fill = "red") + # Set theme and text size
+  theme(panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) +
+  labs(x = "Ward", y = "Number Of Crimes", title = "Crime Count By Ward - Chicago 2021-22")
+```
+
+Plot crime count by community area
+```{r}
+ggplot(chicago, aes(Community.Area)) + geom_bar(fill = "red") + # Set theme and text size
+  theme(panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) +
+  labs(x = "Community Area", y = "Number Of Crimes", title = "Crime Count By Community Area - Chicago 2021-22")
+```
+
+```{r}
+ggplot(ward_by_month_df, aes(x = month, y = total_violent_crimes)) + geom_bar(stat = "identity",fill = "blue") + # Set theme and text size
+  theme(panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) +
+  labs(x = "Month", y = "Number Of Violent Crimes", title = "Violent Crime Count By Month - Chicago 2021-22")
+```
+
+```{r}
+ggplot(ward_by_month_df, aes(x = month, y = non_violent_crimes)) + geom_bar(stat = "identity", fill = "blue") + # Set theme and text size
+  theme(panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) +
+  labs(x = "Month", y = "Number Of Violent Crimes", title = "Non-Violent Crime Count By Month - Chicago 2021-22")
+```
+
+
+```{r}
+ggplot(ward_by_week_df, aes(x = week)) + geom_bar( aes(y = non_violent_crimes), stat = "identity",fill = "blue", alpha = .4) + geom_bar( aes(y = total_violent_crimes), stat = "identity",fill = "red")+ # Set theme and text size
+  theme(panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) +
+  labs(x = "Week", y = "Number Of Crimes", title = "Violent Vs. Non-Violent Crime Count By Week - Chicago 2021-22")
+```
+
+```{r}
+ggplot(ward_by_week_df, aes(x = week)) + geom_bar( aes(y = non_violent_crimes + total_violent_crimes), stat = "identity",fill = "purple", alpha = .2) + geom_bar( aes(y = non_violent_crimes), stat = "identity",fill = "blue", alpha = .7) + geom_bar( aes(y = total_violent_crimes), stat = "identity",fill = "red")+ # Set theme and text size
+  theme(panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) +
+  labs(x = "Week", y = "Number Of Crimes", title = "Violent Vs. Non-Violent Crime Count By Week - Chicago 2021-22")
+```
+
+
+```{r}
+ggplot(ward_by_month_df, aes(x = month)) + geom_bar( aes(y = non_violent_crimes + total_violent_crimes), stat = "identity",fill = "purple", alpha = .2) + geom_bar( aes(y = non_violent_crimes), stat = "identity",fill = "blue", alpha = .7) + geom_bar( aes(y = total_violent_crimes), stat = "identity",fill = "red")+ # Set theme and text size
+  theme(panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) +
+  labs(x = "Month", y = "Number Of Crimes", title = "Violent Vs. Non-Violent Crime Count By Month - Chicago 2021-22")
+```
+
+
+Map out 2022 crimes in chicago with a heat map
+```{r}
+#devtools::install_github("dkahle/ggmap", ref = "tidyup")
+#library(ggmap)
+chicago_m <- get_stamenmap(bbox = c(left = -88.0225, bottom = 41.5949, 
+                                  right = -87.2713, top = 42.0677), 
+                         zoom = 13)
+
+chicago_map <- ggmap(chicago_m) 
+chicago_map <- chicago_map + stat_density2d(data=chicago,  aes(x=Longitude, y=Latitude,fill=0.7, alpha = 0.7), geom="polygon")
+
+
+chicago_map
+
+ggsave(filename="./chicago13.png")
+#chicago_map + geom_point(data = longitude_latitude.new, aes(x = Longitude , y = Latitude, size = 5))
+```
+
+XGBoost
+
+Set training and testing data
+```{r}
+## 75% of the sample size
+smp_size <- floor(0.70 * nrow(beat_by_week_df))
+
+## set the seed to make your partition reproducible
+set.seed(111111)
+train_ind <- sample(seq_len(nrow(beat_by_week_df)), size = smp_size)
+
+train_db <- beat_by_week_df[train_ind, ]
+test_db <- beat_by_week_df[-train_ind, ]
+```
+
+
+
+```{r}
+dtrain
+head(train_db)
+train_db[, c(1:2,5:6)]
+```
+
+
+```{r}
+#dtrain <- xgb.DMatrix(data = as.matrix(train_db[, c(1:2,5:6)], label = (train_db$total_violent_crimes)))
+#dtest <- xgb.DMatrix(data = as.matrix(test_db[, c(1:2,5:6)], label = (test_db$total_violent_crimes)))
+
+dtrain <- xgb.DMatrix(data = as.matrix(train_db[, c(1:2,5:6)]), label = (train_db$total_violent_crimes))
+dtest <- xgb.DMatrix(data = as.matrix(test_db[, c(1:2,5:6)]), label = (test_db$total_violent_crimes))
+```
+
+```{r}
+set.seed(111111)
+bst_1 <- xgboost(data = dtrain, # Set training data
+               
+               nrounds = 100, # Set number of rounds
+               
+               verbose = 1, # 1 - Prints out fit
+                print_every_n = 20, # Prints out result every 20th iteration
+               
+               #objective = "reg:logistic", # Set objective
+               eval_metric = "rmse") # Set evaluation metric to use
+```
+
+
+```{r}
+
+boost_preds_1 <- predict(bst_1, dtest) # Create predictions for xgboost model
+
+pred_dat <- cbind.data.frame(boost_preds_1 , test_db$total_violent_crimes)#
+
+head(pred_dat)
+```
+
+```{r}
+set.seed(111111)
+bst_2 <- xgb.cv(data = dtrain, # Set training data
+               
+               nrounds = 100, # Set number of rounds
+               nfold = 5,
+               verbose = 1, # 1 - Prints out fit
+                print_every_n = 20, # Prints out result every 20th iteration
+               
+               #objective = "reg:logistic", # Set objective
+               eval_metric = "rmse") # Set evaluation metric to use
+
+bst_2$evaluation_log
+```
+
+```{r}
+g_1 <- ggplot(bst_2$evaluation_log, aes(y = test_rmse_mean, x = iter)) +
+  geom_line() +
+    theme(panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) +
+  labs(x = "Iterations", y = "Mean Test Error", title = "Error Curve Against Number of Iterations")
+
+g_1
+```
+
+```{r}
+# Be Careful - This can take a very long time to run
+max_depth_vals <- c(3, 5, 7, 10, 15) # Create vector of max depth values
+min_child_weight <- c(1,3,5,7, 10, 15) # Create vector of min child values
+
+# Expand grid of parameter values
+cv_params <- expand.grid(max_depth_vals, min_child_weight)
+names(cv_params) <- c("max_depth", "min_child_weight")
+# Create results vector
+rmse_vec  <- rep(NA, nrow(cv_params)) 
+# Loop through results
+for(i in 1:nrow(cv_params)){
+  set.seed(111111)
+  bst_tune <- xgb.cv(data = dtrain, # Set training data
+                     
+                     nfold = 5, # Use 5 fold cross-validation
+                     
+                     eta = 0.1, # Set learning rate
+                     max.depth = cv_params$max_depth[i], # Set max depth
+                     min_child_weight = cv_params$min_child_weight[i], # Set minimum number of samples in node to split
+                     
+                     
+                     nrounds = 100, # Set number of rounds
+                     early_stopping_rounds = 20, # Set number of rounds to stop at if there is no improvement
+                     
+                     verbose = 1, # 1 - Prints out fit
+                     nthread = 1, # Set number of parallel threads
+                     print_every_n = 20 # Prints out result every 20th iteration
+                     
+  ) # Set evaluation metric to use
+  
+  rmse_vec[i] <- bst_tune$evaluation_log$test_rmse_mean[bst_tune$best_ntreelimit]
+  
+  
+}
+
+
+# Join results in dataset
+res_db <- cbind.data.frame(cv_params, rmse_vec)
+names(res_db)[3] <- c("rmse") 
+res_db$max_depth <- as.factor(res_db$max_depth) # Convert tree number to factor for plotting
+res_db$min_child_weight <- as.factor(res_db$min_child_weight) # Convert node size to factor for plotting
+# Print AUC heatmap
+g_2 <- ggplot(res_db, aes(y = max_depth, x = min_child_weight, fill = rmse)) + # set aesthetics
+  geom_tile() + # Use geom_tile for heatmap
+  theme_bw() + # Set theme
+  scale_fill_gradient2(low = "blue", # Choose low color
+                       mid = "white", # Choose mid color
+                       high = "red", # Choose high color
+                       midpoint =mean(res_db$rmse), # Choose mid point
+                       space = "Lab", 
+                       na.value ="grey", # Choose NA value
+                       guide = "colourbar", # Set color bar
+                       aesthetics = "fill") + # Select aesthetics to apply
+  labs(x = "Minimum Child Weight", y = "Max Depth", fill = "RMSE") # Set labels
+g_2 # Generate plot
+```
+```{r}
+res_db
+```
+
+
+```{r}
+###### 2 - Gamma Tuning ######
+
+
+gamma_vals <- c(0, 0.05, 0.1, 0.15, 0.2) # Create vector of gamma values
+
+# Be Careful - This can take a very long time to run
+set.seed(111111)
+rmse_vec  <- rep(NA, length(gamma_vals))
+for(i in 1:length(gamma_vals)){
+  bst_tune <- xgb.cv(data = dtrain, # Set training data
+                     
+                     nfold = 5, # Use 5 fold cross-validation
+                     
+                     eta = 0.1, # Set learning rate
+                     max.depth = 5, # Set max depth
+                     min_child_weight = 3, # Set minimum number of samples in node to split
+                     gamma = gamma_vals[i], # Set minimum loss reduction for split
+                     
+                     
+                     
+                     nrounds = 100, # Set number of rounds
+                     early_stopping_rounds = 20, # Set number of rounds to stop at if there is no improvement
+                     
+                     verbose = 1, # 1 - Prints out fit
+                     nthread = 1, # Set number of parallel threads
+                     print_every_n = 20 # Prints out result every 20th iteration
+  ) # Set evaluation metric to use
+  
+  
+  rmse_vec[i] <- bst_tune$evaluation_log$test_rmse_mean[bst_tune$best_ntreelimit]
+  
+  
+}
+
+# Lets view our results to identify the value of gamma to use:
+
+# Gamma results
+# Join gamma to values
+cbind.data.frame(gamma_vals, rmse_vec)
+```
+
+
+```{r}
+###### 3 - Subsample and Column sample Tuning ######
+
+# Be Careful - This can take a very long time to run
+subsample <- c(0.6, 0.7, 0.8, 0.9, 1) # Create vector of subsample values
+colsample_by_tree <- c(0.6, 0.7, 0.8, 0.9, 1) # Create vector of col sample values
+
+# Expand grid of tuning parameters
+cv_params <- expand.grid(subsample, colsample_by_tree)
+names(cv_params) <- c("subsample", "colsample_by_tree")
+# Create vectors to store results
+rmse_vec <- rep(NA, nrow(cv_params)) 
+# Loop through parameter values
+for(i in 1:nrow(cv_params)){
+  set.seed(111111)
+  bst_tune <- xgb.cv(data = dtrain, # Set training data
+                     
+                     nfold = 5, # Use 5 fold cross-validation
+                     
+                     eta = 0.1, # Set learning rate
+                     max.depth = 5, # Set max depth
+                     min_child_weight = 3, # Set minimum number of samples in node to split
+                     gamma = 0.2, # Set minimum loss reduction for split
+                     subsample = cv_params$subsample[i], # Set proportion of training data to use in tree
+                     colsample_bytree = cv_params$colsample_by_tree[i], # Set number of variables to use in each tree
+                     
+                     nrounds = 150, # Set number of rounds
+                     early_stopping_rounds = 20, # Set number of rounds to stop at if there is no improvement
+                     
+                     verbose = 1, # 1 - Prints out fit
+                     nthread = 1, # Set number of parallel threads
+                     print_every_n = 20 # Prints out result every 20th iteration
+  ) # Set evaluation metric to use
+  
+  
+  rmse_vec[i] <- bst_tune$evaluation_log$test_rmse_mean[bst_tune$best_ntreelimit]
+  
+  
+}
+
+
+
+
+
+
+
+# visualise tuning sample params
+
+res_db <- cbind.data.frame(cv_params, rmse_vec)
+names(res_db)[3] <- c("rmse") 
+res_db$subsample <- as.factor(res_db$subsample) # Convert tree number to factor for plotting
+res_db$colsample_by_tree <- as.factor(res_db$colsample_by_tree) # Convert node size to factor for plotting
+g_4 <- ggplot(res_db, aes(y = colsample_by_tree, x = subsample, fill = rmse)) + # set aesthetics
+  geom_tile() + # Use geom_tile for heatmap
+  theme_bw() + # Set theme
+  scale_fill_gradient2(low = "blue", # Choose low color
+                       mid = "white", # Choose mid color
+                       high = "red", # Choose high color
+                       midpoint =mean(res_db$rmse), # Choose mid point
+                       space = "Lab", 
+                       na.value ="grey", # Choose NA value
+                       guide = "colourbar", # Set color bar
+                       aesthetics = "fill") + # Select aesthetics to apply
+  labs(x = "Subsample", y = "Column Sample by Tree", fill = "RMSE") # Set labels
+g_4 # Generate plot
+```
+```{r}
+res_db
+```
+
+
+```{r}
+###### 4 - eta tuning ######
+
+# Use xgb.cv to run cross-validation inside xgboost
+set.seed(111111)
+bst_mod_1 <- xgb.cv(data = dtrain, # Set training data
+                    
+                    nfold = 5, # Use 5 fold cross-validation
+                    
+                    eta = 0.3, # Set learning rate
+                    max.depth = 5, # Set max depth
+                    min_child_weight = 3, # Set minimum number of samples in node to split
+                    gamma = 0.2, # Set minimum loss reduction for split
+                    subsample = 0.7, # Set proportion of training data to use in tree
+                    colsample_bytree =  0.65, # Set number of variables to use in each tree
+                    
+                    nrounds = 1000, # Set number of rounds
+                    early_stopping_rounds = 20, # Set number of rounds to stop at if there is no improvement
+                    
+                    verbose = 1, # 1 - Prints out fit
+                    nthread = 1, # Set number of parallel threads
+                    print_every_n = 20 # Prints out result every 20th iteration
+) # Set evaluation metric to use
+
+set.seed(111111)
+bst_mod_2 <- xgb.cv(data = dtrain, # Set training data
+                    
+                    nfold = 5, # Use 5 fold cross-validation
+                    
+                    eta = 0.1, # Set learning rate
+                    max.depth = 5, # Set max depth
+                    min_child_weight = 3, # Set minimum number of samples in node to split
+                    gamma = 0.2, # Set minimum loss reduction for split
+                    subsample = 0.7, # Set proportion of training data to use in tree
+                    colsample_bytree =  0.65, # Set number of variables to use in each tree
+                    
+                    nrounds = 1000, # Set number of rounds
+                    early_stopping_rounds = 20, # Set number of rounds to stop at if there is no improvement
+                    
+                    verbose = 1, # 1 - Prints out fit
+                    nthread = 1, # Set number of parallel threads
+                    print_every_n = 20 # Prints out result every 20th iteration
+) # Set evaluation metric to use
+
+set.seed(111111)
+bst_mod_3 <- xgb.cv(data = dtrain, # Set training data
+                    
+                    nfold = 5, # Use 5 fold cross-validation
+                    
+                    eta = 0.05, # Set learning rate
+                    max.depth = 5, # Set max depth
+                    min_child_weight = 3, # Set minimum number of samples in node to split
+                    gamma = 0.2, # Set minimum loss reduction for split
+                    subsample = 0.7, # Set proportion of training data to use in tree
+                    colsample_bytree =  0.65, # Set number of variables to use in each tree
+                    
+                    nrounds = 1000, # Set number of rounds
+                    early_stopping_rounds = 20, # Set number of rounds to stop at if there is no improvement
+                    
+                    verbose = 1, # 1 - Prints out fit
+                    nthread = 1, # Set number of parallel threads
+                    print_every_n = 20 # Prints out result every 20th iteration
+) # Set evaluation metric to use
+
+
+set.seed(111111)
+bst_mod_4 <- xgb.cv(data = dtrain, # Set training data
+                    
+                    nfold = 5, # Use 5 fold cross-validation
+                    
+                    eta = 0.01, # Set learning rate
+                    max.depth = 5, # Set max depth
+                    min_child_weight = 3, # Set minimum number of samples in node to split
+                    gamma = 0.2, # Set minimum loss reduction for split
+                    subsample = 0.7, # Set proportion of training data to use in tree
+                    colsample_bytree =  0.65, # Set number of variables to use in each tree
+                    
+                    nrounds = 1000, # Set number of rounds
+                    early_stopping_rounds = 20, # Set number of rounds to stop at if there is no improvement
+                    
+                    verbose = 1, # 1 - Prints out fit
+                    nthread = 1, # Set number of parallel threads
+                    print_every_n = 20 # Prints out result every 20th iteration
+) # Set evaluation metric to use
+
+
+
+set.seed(111111)
+bst_mod_5 <- xgb.cv(data = dtrain, # Set training data
+                    
+                    nfold = 5, # Use 5 fold cross-validation
+                    
+                    eta = 0.005, # Set learning rate
+                    max.depth = 5, # Set max depth
+                    min_child_weight = 3, # Set minimum number of samples in node to split
+                    gamma = 0.2, # Set minimum loss reduction for split
+                    subsample = 0.7, # Set proportion of training data to use in tree
+                    colsample_bytree =  0.65, # Set number of variables to use in each tree
+                    
+                    nrounds = 1000, # Set number of rounds
+                    early_stopping_rounds = 20, # Set number of rounds to stop at if there is no improvement
+                    
+                    verbose = 1, # 1 - Prints out fit
+                    nthread = 1, # Set number of parallel threads
+                    print_every_n = 20 # Prints out result every 20th iteration
+                    
+) # Set evaluation metric to use
+```
+
+
+```{r}
+# eta plots
+
+# Extract results for model with eta = 0.3
+pd1 <- cbind.data.frame(bst_mod_1$evaluation_log[,c("iter", "test_rmse_mean")], rep(0.3, nrow(bst_mod_1$evaluation_log)))
+names(pd1)[3] <- "eta"
+# Extract results for model with eta = 0.1
+pd2 <- cbind.data.frame(bst_mod_2$evaluation_log[,c("iter", "test_rmse_mean")], rep(0.1, nrow(bst_mod_2$evaluation_log)))
+names(pd2)[3] <- "eta"
+# Extract results for model with eta = 0.05
+pd3 <- cbind.data.frame(bst_mod_3$evaluation_log[,c("iter", "test_rmse_mean")], rep(0.05, nrow(bst_mod_3$evaluation_log)))
+names(pd3)[3] <- "eta"
+# Extract results for model with eta = 0.01
+pd4 <- cbind.data.frame(bst_mod_4$evaluation_log[,c("iter", "test_rmse_mean")], rep(0.01, nrow(bst_mod_4$evaluation_log)))
+names(pd4)[3] <- "eta"
+# Extract results for model with eta = 0.005
+pd5 <- cbind.data.frame(bst_mod_5$evaluation_log[,c("iter", "test_rmse_mean")], rep(0.005, nrow(bst_mod_5$evaluation_log)))
+names(pd5)[3] <- "eta"
+# Join datasets
+plot_data <- rbind.data.frame(pd1, pd2, pd3, pd4, pd5)
+# Converty ETA to factor
+plot_data$eta <- as.factor(plot_data$eta)
+# Plot points
+g_6 <- ggplot(plot_data, aes(x = iter, y = test_rmse_mean, color = eta))+
+  geom_point(alpha = 0.5) +
+  theme_bw() + # Set theme
+  theme(panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) + # Remove grid 
+  labs(x = "Number of Trees", title = "RMSE v Number of Trees",
+       y = "RMSE", color = "Learning \n Rate")  # Set labels
+g_6
+
+# Plot lines
+g_7 <- ggplot(plot_data, aes(x = iter, y = test_rmse_mean, color = eta))+
+  geom_smooth(alpha = 0.5) +
+  theme_bw() + # Set theme
+  theme(panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) + # Remove grid 
+  labs(x = "Number of Trees", title = "RMSE v Number of Trees",
+       y = "RMSE", color = "Learning \n Rate")  # Set labels
+g_7
+```
+
+
+```{r}
+# fit final xgb model
+set.seed(111111)
+bst_final <- xgboost(data = dtrain, # Set training data
+                     
+                     
+                     
+                     eta = 0.05, # Set learning rate
+                     max.depth =  5, # Set max depth
+                     min_child_weight = 3, # Set minimum number of samples in node to split
+                     gamma = 0.2, # Set minimum loss reduction for split
+                     subsample =  0.7, # Set proportion of training data to use in tree
+                     colsample_bytree = 0.65, # Set number of variables to use in each tree
+                     
+                     nrounds = 100, # Set number of rounds
+                     early_stopping_rounds = 20, # Set number of rounds to stop at if there is no improvement
+                     
+                     verbose = 1, # 1 - Prints out fit
+                     nthread = 1, # Set number of parallel threads
+                     print_every_n = 20 # Prints out result every 20th iteration
+                     
+) # Set evaluation metric to use
+```
+
+```{r}
+boost_preds_final <- predict(bst_final, dtest) # Create predictions for xgboost model
+pred_dat <- cbind.data.frame(boost_preds_final , test_db$total_violent_crimes)
+```
+
+```{r}
+rmse(pred_dat$`test_db$total_violent_crimes`,pred_dat$boost_preds_final)
+mae(pred_dat$`test_db$total_violent_crimes`,pred_dat$boost_preds_final)
+```
+
+
+
+
+```{r}
+source("a_insights_shap_functions.r")
+```
+
+
+```{r}
+# Calculate SHAP importance
+shap_result <- shap.score.rank(xgb_model = bst_final, 
+                X_train =as.matrix(train_db[, c(1:2,5:6)]),
+                shap_approx = F)
+# Plot SHAP importance
+var_importance(shap_result, top_n=10)
+```
+
+```{r}
+shap_long = shap.prep(shap = shap_result,
+                           X_train = as.matrix(train_db[, c(1:2,5:6)]), 
+                           top_n = 4)
+
+
+plot.shap.summary(data_long = shap_long)
+
+```
+
+
+
+
+```{r}
+beat_by_week_df$Beat <- as.factor(beat_by_week_df$Beat)
+beat_by_week_df_dummy <- dummy_cols(
+  beat_by_week_df,
+  select_columns = "Beat",
+  remove_selected_columns = TRUE,
+)
+
+train_db <- beat_by_week_df_dummy[train_ind, ]
+test_db <- beat_by_week_df_dummy[-train_ind, ]
+```
+
+
+```{r}
+dtrain <- xgb.DMatrix(data = as.matrix(train_db[, c(1,4:ncol(train_db))]), label = (train_db$total_violent_crimes))
+dtest <- xgb.DMatrix(data = as.matrix(test_db[, c(1,4:ncol(test_db))]), label = (test_db$total_violent_crimes))
+```
+
+
+
+
+
